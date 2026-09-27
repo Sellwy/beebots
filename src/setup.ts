@@ -5,11 +5,13 @@
 //  - caps on the calls that cost money (designs and portraits, in total and per visitor).
 // The owner picks an owner password here; later writes from the public dashboard need it (gate.ts).
 // After a save the engine exits and Docker restarts it with the new settings, in paper trading.
-// Each bee is designed from one sentence ("how do you want this bee to trade?"): OpenAI invents its name, rules, coins
-// and look, the engine checks the coins against OKX's live list and picks the brain it runs on, then OpenAI paints it.
+// Each bee is designed from one sentence ("how do you want this bee to trade?"): with an OpenAI key, OpenAI invents its
+// name, rules, coins and look and paints its portrait. Without one, the owner types the bee by hand and uploads a
+// portrait; either way the engine checks the coins against OKX's live list and picks the brain the bee runs on.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
+import { Jimp } from "jimp";
 import { z } from "zod";
 import { BEES } from "./config.js";
 import { hashPassword, MAX_PASSWORD, MIN_PASSWORD, readJson, send } from "./gate.js";
@@ -26,10 +28,39 @@ import { BeeSchema, isReservedName, saveSettings, STYLE_INFO, STYLES, type Setti
 
 const MAX_PAINTS = 24;
 const MAX_DESIGNS = 60;
+/** Uploaded portraits per Setup run, total (they are free, but each one is parsed and re-encoded). */
+const MAX_UPLOADS = 24;
 /** Per visitor (client address): paid or outbound calls (designs, portraits, key checks). */
 const MAX_CALLS_PER_ADDR = 40;
 const COINS_TTL_MS = 10 * 60_000;
 const MAX_BODY = 32 * 1024;
+/** Portraits are stored 512x512 JPEG (the dashboard shows them at ~96-256 px). */
+const PORTRAIT_SIZE = 512;
+const JPEG_QUALITY = 85;
+/** Upload cap in base64 characters: ~8 MB of image (base64 is 4/3 of the bytes). */
+const MAX_IMAGE_CHARS = 11_000_000;
+
+/**
+ * An uploaded portrait: whatever the browser sent (data URL or bare base64), squashed to a square JPEG.
+ * Decoding never trusts the claimed mime type: Jimp sniffs the real bytes.
+ */
+async function decodeImage(dataUrl: string): Promise<{ jpg: Buffer; width: number; height: number }> {
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(dataUrl.trim());
+  const b64 = m?.[2];
+  if (!m || !b64) throw new DesignError("Send the image as a base64 data URL (jpeg, png or webp).");
+  const bytes = Buffer.from(b64.replace(/\s+/g, ""), "base64");
+  if (!bytes.length) throw new DesignError("That image came through empty. Try exporting it as a PNG or JPEG.");
+  let img;
+  try {
+    img = await Jimp.read(bytes);
+  } catch {
+    throw new DesignError("Couldn't read that image. Try exporting it as a PNG or JPEG.");
+  }
+  if (img.width !== img.height) img.cover({ w: Math.min(img.width, img.height), h: Math.min(img.width, img.height) });
+  if (img.width > PORTRAIT_SIZE) img.resize({ w: PORTRAIT_SIZE, h: PORTRAIT_SIZE });
+  const jpg = await img.getBuffer("image/jpeg", { quality: JPEG_QUALITY });
+  return { jpg, width: img.width, height: img.height };
+}
 
 export interface SetupOpts {
   settingsPath: string;
@@ -132,6 +163,7 @@ export class Setup {
   private calls = new Map<string, number>();
   private paints = 0;
   private designs = 0;
+  private uploads = 0;
   private saved = false;
   private coins: { at: number; list: string[] } | null = null;
 
@@ -205,7 +237,7 @@ export class Setup {
       send(res, 410, { error: TIMED_OUT, timedOut: true });
       return true;
     }
-    if (path === "/setup/design" || path === "/setup/paint" || path === "/setup/check-jev" || path === "/setup/check-openai") {
+    if (path === "/setup/design" || path === "/setup/paint" || path === "/setup/upload" || path === "/setup/check-jev" || path === "/setup/check-openai") {
       const addr = clientAddr(req.headers["x-forwarded-for"], req.socket.remoteAddress);
       const n = (this.calls.get(addr) ?? 0) + 1;
       if (n > MAX_CALLS_PER_ADDR) {
@@ -216,7 +248,8 @@ export class Setup {
     }
     let body: Record<string, unknown>;
     try {
-      body = (await readJson(req, MAX_BODY)) as Record<string, unknown>;
+      // Portraits ride in the JSON body as base64 data URLs, so the upload route gets a much bigger cap.
+      body = (await readJson(req, path === "/setup/upload" ? MAX_IMAGE_CHARS + 2048 : MAX_BODY)) as Record<string, unknown>;
     } catch {
       send(res, 400, { error: "bad request" });
       return true;
@@ -292,6 +325,22 @@ export class Setup {
         return send(res, 200, { ok: true, url: `/bee-image/${BEES[slot]}?v=${Date.now()}` });
       }
 
+      case "/setup/upload": {
+        const slot = Number(body.slot);
+        if (!Number.isInteger(slot) || slot < 0 || slot > 2) return send(res, 400, { error: "bad bee" });
+        const data = typeof body.image === "string" ? body.image : "";
+        if (data.length < 64) return send(res, 400, { error: "Pick an image file first." });
+        if (data.length > MAX_IMAGE_CHARS) return send(res, 413, { error: "That image is too large (over 8 MB). Export it as a JPEG and try again." });
+        if (this.uploads >= MAX_UPLOADS) return send(res, 429, { error: "That is a lot of portraits. Restart the engine to upload more." });
+        const { jpg, width, height } = await decodeImage(data);
+        this.uploads++;
+        const dir = imageDir(this.o.settingsPath);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${BEES[slot]}.jpg`), jpg);
+        log.info("portrait uploaded", { slot: BEES[slot], width, height, bytes: jpg.length });
+        return send(res, 200, { ok: true, url: `/bee-image/${BEES[slot]}?v=${Date.now()}` });
+      }
+
       case "/setup/save": {
         const parsed = SaveBody.safeParse(body);
         if (!parsed.success) {
@@ -299,7 +348,6 @@ export class Setup {
           return send(res, 400, { error: `Something is missing or not allowed (${what}).` });
         }
         const b = parsed.data;
-        if (!b.openaiKey && !this.o.openai.apiKey) return send(res, 400, { error: "Your bees need an OpenAI key (it designs and paints them)." });
         const missing = BEES.filter((slot) => imagePath(this.o.settingsPath, slot) === null);
         if (missing.length) return send(res, 400, { error: "Every bee needs its portrait before you start." });
         const jevErr = await this.checkJev(b.jevKey, this.o.jevModel);

@@ -19,7 +19,8 @@ const BEES = [
   { name: "Rex", style: "boozy", tagline: "the wild one", rules: "Chase whatever is pumping hardest this week.", coins: [], look: "a bee with a dinosaur hoodie", image: true },
 ];
 const ACCEPT = { notAdvice: true, paperDefault: true, ownRisk: true };
-const SAVE = { jevKey: "good-jev-key", openaiKey: "sk-test-key", ownerPassword: "correct horse", accept: ACCEPT, bees: BEES, hive: false };
+const SAVE = { jevKey: "good-jev-key", ownerPassword: "correct horse", accept: ACCEPT, bees: BEES, hive: false };
+const SAVE_WITH_KEY = { ...SAVE, openaiKey: "sk-test-key" };
 
 const design = (over: Partial<BeeDesign> = {}): BeeDesign => ({
   name: "Donny",
@@ -170,12 +171,29 @@ describe("setup", () => {
     expect((await t.post("/setup/save", { ...SAVE, bees: bare })).status).toBe(400);
   });
 
-  it("needs an OpenAI key to save", async () => {
+  it("uploads portraits without an OpenAI key, and saves without one", async () => {
+    const t = await boot();
+    const jpg = (await import("node:fs")).readFileSync(join("dashboard", "public", "bees", "bizzy.jpg"));
+    const dataUrl = `data:image/jpeg;base64,${jpg.toString("base64")}`;
+    for (const slot of [0, 1, 2]) {
+      const r = await t.post("/setup/upload", { slot, image: dataUrl });
+      expect(r.status).toBe(200);
+    }
+    // A 1x1 PNG, not a JPEG: the engine sniffs the bytes and re-encodes.
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+    expect((await t.post("/setup/upload", { slot: 0, image: `data:image/png;base64,${png.toString("base64")}` })).status).toBe(200);
+    expect((await t.post("/setup/upload", { slot: 0, image: "data:image/png;base64,not-base64!" })).status).toBe(400);
+    expect((await t.post("/setup/upload", { slot: 9, image: dataUrl })).status).toBe(400);
+    const r = await t.post("/setup/save", SAVE);
+    expect(r.status).toBe(200);
+    expect(loadSettings(t.settingsPath)).not.toBeNull();
+  });
+
+  it("still saves with an OpenAI key when one is given", async () => {
     const t = await boot();
     t.paintAll();
-    const noKey: Record<string, unknown> = { ...SAVE };
-    delete noKey.openaiKey;
-    expect((await t.post("/setup/save", noKey)).status).toBe(400);
+    expect((await t.post("/setup/save", SAVE_WITH_KEY)).status).toBe(200);
+    expect(loadSettings(t.settingsPath)!.openaiKey).toBe("sk-test-key");
   });
 
   it("re-checks coins and the brain on save: unknown coins dropped, style forced from the coins", async () => {

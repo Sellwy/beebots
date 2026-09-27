@@ -1452,6 +1452,9 @@ textarea.setup-input {
   margin-top: 24px !important;
   text-align: center;
 }
+.setup-bees-openai {
+  margin-top: 10px;
+}
 .setup-bees {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
